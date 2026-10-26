@@ -1,0 +1,8 @@
+# LoopHands sandbox: Chromium's own sandbox needs unprivileged user namespaces. Where the guest
+# kernel does not offer them, Chromium cannot start without --no-sandbox; add it only then. The
+# whole guest is already the bot's sandbox (a separate WSL distro with no Windows access).
+if ! unshare --user --map-root-user true >/dev/null 2>&1; then
+  export CHROMIUM_FLAGS="$CHROMIUM_FLAGS --no-sandbox --test-type"
+fi
+# No first-run or default-browser prompts on a fresh bot computer.
+export CHROMIUM_FLAGS="$CHROMIUM_FLAGS --no-first-run --password-store=basic"

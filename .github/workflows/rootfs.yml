@@ -1,0 +1,140 @@
+# Builds the LoopHands sandbox rootfs (ADR-007, CHECKLIST P7): Debian 12 with Xvnc, XFCE,
+# Chromium, xdotool and the Playwright libraries. Plan A: CI builds unsigned artifacts only and
+# holds no secrets. The artifacts are downloaded, signed offline and published on LoopHands-releases
+# (see the LoopHands release steps). A push builds a throwaway `ci` image only. The image is
+# reproducible: a second clean build must give the same SHA-256 or the run fails.
+name: rootfs
+
+on:
+  workflow_dispatch:
+    inputs:
+      version:
+        description: 'Image version, a whole number (e.g. 3)'
+        type: string
+        required: true
+  push:
+    paths:
+      - 'sandbox/rootfs/**'
+      - '.github/workflows/rootfs.yml'
+
+permissions:
+  contents: read
+
+concurrency:
+  group: rootfs-${{ github.event_name }}-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'push' }}
+
+jobs:
+  build:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 90
+    outputs:
+      sha256: ${{ steps.hash.outputs.sha256 }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: docker/setup-buildx-action@f87e5991a6d7451dcb8d9637bfbc97413f497069 # v4.4.1
+      - name: Resolve the image version
+        id: ver
+        env:
+          EVENT: ${{ github.event_name }}
+          INPUT_VERSION: ${{ inputs.version }}
+        run: |
+          if [ "$EVENT" = "workflow_dispatch" ]; then
+            if ! [[ "$INPUT_VERSION" =~ ^[1-9][0-9]*$ ]]; then
+              echo "::error::version must be a whole number >= 1"
+              exit 1
+            fi
+            echo "version=$INPUT_VERSION" >> "$GITHUB_OUTPUT"
+          else
+            echo "version=ci" >> "$GITHUB_OUTPUT"
+          fi
+      - name: Install Syft and OSV-Scanner
+        run: sudo bash sandbox/rootfs/ci-tools.sh
+      - name: Build the rootfs
+        env:
+          VERSION: ${{ steps.ver.outputs.version }}
+        run: bash sandbox/rootfs/build.sh "$VERSION"
+      - name: Check the hardening inside the image
+        env:
+          IMAGE: loophands-rootfs:${{ steps.ver.outputs.version }}
+        run: |
+          docker run --rm "$IMAGE" sh -c '
+            grep -qx "enabled = false" /etc/wsl.conf &&
+            grep -qx "appendWindowsPath = false" /etc/wsl.conf &&
+            id bot && command -v Xvnc chromium xdotool'
+      - name: Hash the image
+        id: hash
+        env:
+          VERSION: ${{ steps.ver.outputs.version }}
+        run: |
+          echo "sha256=$(sha256sum "sandbox/rootfs/out/loophands-rootfs-$VERSION.tar.gz" | cut -d' ' -f1)" >> "$GITHUB_OUTPUT"
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: loophands-rootfs-${{ steps.ver.outputs.version }}
+          path: sandbox/rootfs/out/
+          retention-days: ${{ github.event_name == 'workflow_dispatch' && 30 || 3 }}
+          if-no-files-found: error
+
+  rebuild:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 90
+    outputs:
+      sha256: ${{ steps.hash.outputs.sha256 }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: docker/setup-buildx-action@f87e5991a6d7451dcb8d9637bfbc97413f497069 # v4.4.1
+      - name: Resolve the image version
+        id: ver
+        env:
+          EVENT: ${{ github.event_name }}
+          INPUT_VERSION: ${{ inputs.version }}
+        run: |
+          if [ "$EVENT" = "workflow_dispatch" ]; then
+            if ! [[ "$INPUT_VERSION" =~ ^[1-9][0-9]*$ ]]; then
+              echo "::error::version must be a whole number >= 1"
+              exit 1
+            fi
+            echo "version=$INPUT_VERSION" >> "$GITHUB_OUTPUT"
+          else
+            echo "version=ci" >> "$GITHUB_OUTPUT"
+          fi
+      - name: Install Syft and OSV-Scanner
+        run: sudo bash sandbox/rootfs/ci-tools.sh
+      - name: Build the rootfs a second time
+        env:
+          VERSION: ${{ steps.ver.outputs.version }}
+        run: bash sandbox/rootfs/build.sh "$VERSION"
+      - name: Hash the image
+        id: hash
+        env:
+          VERSION: ${{ steps.ver.outputs.version }}
+        run: |
+          echo "sha256=$(sha256sum "sandbox/rootfs/out/loophands-rootfs-$VERSION.tar.gz" | cut -d' ' -f1)" >> "$GITHUB_OUTPUT"
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: rebuild-contents-${{ steps.ver.outputs.version }}
+          path: sandbox/rootfs/out/loophands-rootfs-${{ steps.ver.outputs.version }}.contents.txt
+          retention-days: 7
+          if-no-files-found: error
+
+  reproducible:
+    needs: [build, rebuild]
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    steps:
+      - name: Compare the two builds
+        env:
+          FIRST: ${{ needs.build.outputs.sha256 }}
+          SECOND: ${{ needs.rebuild.outputs.sha256 }}
+        run: |
+          if [ -z "$FIRST" ] || [ "$FIRST" != "$SECOND" ]; then
+            echo "build:   $FIRST"
+            echo "rebuild: $SECOND"
+            echo "::error::The image is not reproducible. Diff the contents.txt files in the loophands-rootfs-* and rebuild-contents-* artifacts."
+            exit 1
+          fi
+          echo "Reproducible: $FIRST"
